@@ -12,13 +12,13 @@ import dataclasses
 import gc
 import os
 import time
-from collections import defaultdict
 from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Any
 
 import torch
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.system_utils import find_loaded_library
@@ -233,7 +233,11 @@ class CuMemAllocator:
         This method is optimized with:
         1. Async memory copies using CUDA streams
         2. Batched memory mapping operations
-        3. Parallel processing across different tags using separate streams
+        3. Multiple parallel streams to maximize PCIe bandwidth utilization
+        4. Round-robin distribution of allocations across streams
+
+        The number of parallel copy streams can be configured via the
+        VLLM_WAKEUP_NUM_STREAMS environment variable.
 
         :param tags: The tags of the memory allocation that will be loaded
             back to GPU memory. If None, all memory allocation will be loaded
@@ -241,55 +245,65 @@ class CuMemAllocator:
         """
         time_start = time.perf_counter()
 
-        # Group allocations by tag for parallel processing
-        allocations_by_tag: dict[str, list[tuple[int, AllocationData]]] = defaultdict(
-            list
-        )
+        # Number of parallel streams for memory copies
+        # More streams can help saturate PCIe bandwidth with multiple
+        # concurrent transfers. Default of 4 works well for most systems.
+        # Cap between 1 and 32 to avoid overhead from too many streams.
+        num_streams = max(1, min(32, envs.VLLM_WAKEUP_NUM_STREAMS))
+        if envs.VLLM_WAKEUP_NUM_STREAMS != num_streams:
+            logger.warning(
+                "VLLM_WAKEUP_NUM_STREAMS=%d is outside valid range [1, 32], "
+                "clamping to %d",
+                envs.VLLM_WAKEUP_NUM_STREAMS,
+                num_streams,
+            )
+
+        # Collect all allocations that need to be woken up
+        allocations_to_wake: list[tuple[int, AllocationData]] = []
         for ptr, data in self.pointer_to_data.items():
             if tags is None or data.tag in tags:
-                allocations_by_tag[data.tag].append((ptr, data))
+                allocations_to_wake.append((ptr, data))
 
-        if not allocations_by_tag:
+        if not allocations_to_wake:
             return
 
         time_after_grouping = time.perf_counter()
 
-        # Create a separate CUDA stream for each tag
-        tag_streams: dict[str, Any] = {}
-        for tag in allocations_by_tag:
-            tag_streams[tag] = libcudart.cudaStreamCreate()
+        # Create multiple CUDA streams for parallel H2D transfers to
+        # better utilize PCIe bandwidth, especially for many small allocations
+        streams: list[Any] = []
+        for _ in range(num_streams):
+            streams.append(libcudart.cudaStreamCreate())
 
         time_after_stream_creation = time.perf_counter()
 
-        # Batch all memory mapping operations
-        # Memory mapping is relatively fast but benefits from being done
-        # in a tight loop without interleaving with memory copies
-        for tag, allocs in allocations_by_tag.items():
-            for ptr, data in allocs:
-                create_and_map(data.handle)
+        # Batch all memory mapping operations in a tight loop without
+        # interleaving with memory copies
+        for ptr, data in allocations_to_wake:
+            create_and_map(data.handle)
 
         time_after_mapping = time.perf_counter()
 
-        # Issue all async memory copies in parallel across tags
-        # Each tag uses its own stream, allowing parallel H2D transfers
+        # Issue async memory copies distributed across streams
+        # Round-robin assignment distributes work evenly across streams
         pending_cleanups: list[AllocationData] = []
-        for tag, allocs in allocations_by_tag.items():
-            stream = tag_streams[tag]
-            for ptr, data in allocs:
-                if data.cpu_backup_tensor is not None:
-                    cpu_backup_tensor = data.cpu_backup_tensor
-                    size_in_bytes = (
-                        cpu_backup_tensor.numel() * cpu_backup_tensor.element_size()
-                    )
-                    cpu_ptr = cpu_backup_tensor.data_ptr()
-                    # Use async copy - doesn't block (optimization #1)
-                    libcudart.cudaMemcpyAsync(ptr, cpu_ptr, size_in_bytes, stream)
-                    pending_cleanups.append(data)
+        for i, (ptr, data) in enumerate(allocations_to_wake):
+            if data.cpu_backup_tensor is not None:
+                cpu_backup_tensor = data.cpu_backup_tensor
+                size_in_bytes = (
+                    cpu_backup_tensor.numel() * cpu_backup_tensor.element_size()
+                )
+                cpu_ptr = cpu_backup_tensor.data_ptr()
+                # Round-robin stream assignment for load balancing
+                stream = streams[i % num_streams]
+                # Use async copy - doesn't block
+                libcudart.cudaMemcpyAsync(ptr, cpu_ptr, size_in_bytes, stream)
+                pending_cleanups.append(data)
 
         time_after_async_copies = time.perf_counter()
 
-        # Synchronize all streams and cleanup
-        for tag, stream in tag_streams.items():
+        # Phase 3: Synchronize all streams and cleanup
+        for stream in streams:
             libcudart.cudaStreamSynchronize(stream)
             libcudart.cudaStreamDestroy(stream)
 
@@ -302,9 +316,12 @@ class CuMemAllocator:
         time_end = time.perf_counter()
 
         logger.debug(
-            "CuMemAllocator wake_up timing breakdown: "
-            "grouping=%.4fs, stream_creation=%.4fs, mapping=%.4fs, "
-            "async_copies=%.4fs, sync=%.4fs, cleanup=%.4fs, total=%.4fs",
+            "CuMemAllocator wake_up timing breakdown (num_streams=%d, "
+            "num_allocations=%d): grouping=%.4fs, stream_creation=%.4fs, "
+            "mapping=%.4fs, async_copies=%.4fs, sync=%.4fs, cleanup=%.4fs, "
+            "total=%.4fs",
+            num_streams,
+            len(allocations_to_wake),
             time_after_grouping - time_start,
             time_after_stream_creation - time_after_grouping,
             time_after_mapping - time_after_stream_creation,
