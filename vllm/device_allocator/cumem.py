@@ -11,6 +11,8 @@
 import dataclasses
 import gc
 import os
+import time
+from collections import defaultdict
 from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Any
@@ -228,23 +230,89 @@ class CuMemAllocator:
         All data that is previously offloaded will be loaded back to GPU
         memory, and the rest of the data will have empty memory.
 
+        This method is optimized with:
+        1. Async memory copies using CUDA streams
+        2. Batched memory mapping operations
+        3. Parallel processing across different tags using separate streams
+
         :param tags: The tags of the memory allocation that will be loaded
             back to GPU memory. If None, all memory allocation will be loaded
             back to GPU memory.
         """
+        time_start = time.perf_counter()
+
+        # Group allocations by tag for parallel processing
+        allocations_by_tag: dict[str, list[tuple[int, AllocationData]]] = defaultdict(
+            list
+        )
         for ptr, data in self.pointer_to_data.items():
             if tags is None or data.tag in tags:
-                handle = data.handle
-                create_and_map(handle)
+                allocations_by_tag[data.tag].append((ptr, data))
+
+        if not allocations_by_tag:
+            return
+
+        time_after_grouping = time.perf_counter()
+
+        # Create a separate CUDA stream for each tag
+        tag_streams: dict[str, Any] = {}
+        for tag in allocations_by_tag:
+            tag_streams[tag] = libcudart.cudaStreamCreate()
+
+        time_after_stream_creation = time.perf_counter()
+
+        # Batch all memory mapping operations
+        # Memory mapping is relatively fast but benefits from being done
+        # in a tight loop without interleaving with memory copies
+        for tag, allocs in allocations_by_tag.items():
+            for ptr, data in allocs:
+                create_and_map(data.handle)
+
+        time_after_mapping = time.perf_counter()
+
+        # Issue all async memory copies in parallel across tags
+        # Each tag uses its own stream, allowing parallel H2D transfers
+        pending_cleanups: list[AllocationData] = []
+        for tag, allocs in allocations_by_tag.items():
+            stream = tag_streams[tag]
+            for ptr, data in allocs:
                 if data.cpu_backup_tensor is not None:
                     cpu_backup_tensor = data.cpu_backup_tensor
-                    if cpu_backup_tensor is not None:
-                        size_in_bytes = (
-                            cpu_backup_tensor.numel() * cpu_backup_tensor.element_size()
-                        )
-                        cpu_ptr = cpu_backup_tensor.data_ptr()
-                        libcudart.cudaMemcpy(ptr, cpu_ptr, size_in_bytes)
-                        data.cpu_backup_tensor = None
+                    size_in_bytes = (
+                        cpu_backup_tensor.numel() * cpu_backup_tensor.element_size()
+                    )
+                    cpu_ptr = cpu_backup_tensor.data_ptr()
+                    # Use async copy - doesn't block (optimization #1)
+                    libcudart.cudaMemcpyAsync(ptr, cpu_ptr, size_in_bytes, stream)
+                    pending_cleanups.append(data)
+
+        time_after_async_copies = time.perf_counter()
+
+        # Synchronize all streams and cleanup
+        for tag, stream in tag_streams.items():
+            libcudart.cudaStreamSynchronize(stream)
+            libcudart.cudaStreamDestroy(stream)
+
+        time_after_sync = time.perf_counter()
+
+        # Cleanup CPU backup tensors after all copies complete
+        for data in pending_cleanups:
+            data.cpu_backup_tensor = None
+
+        time_end = time.perf_counter()
+
+        logger.debug(
+            "CuMemAllocator wake_up timing breakdown: "
+            "grouping=%.4fs, stream_creation=%.4fs, mapping=%.4fs, "
+            "async_copies=%.4fs, sync=%.4fs, cleanup=%.4fs, total=%.4fs",
+            time_after_grouping - time_start,
+            time_after_stream_creation - time_after_grouping,
+            time_after_mapping - time_after_stream_creation,
+            time_after_async_copies - time_after_mapping,
+            time_after_sync - time_after_async_copies,
+            time_end - time_after_sync,
+            time_end - time_start,
+        )
 
     @contextmanager
     def use_memory_pool(self, tag: str | None = None):

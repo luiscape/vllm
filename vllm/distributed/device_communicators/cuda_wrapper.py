@@ -25,6 +25,7 @@ logger = init_logger(__name__)
 
 cudaError_t = ctypes.c_int
 cudaMemcpyKind = ctypes.c_int
+cudaStream_t = ctypes.c_void_p
 
 
 class cudaIpcMemHandle_t(ctypes.Structure):
@@ -66,6 +67,36 @@ class CudaRTLibrary:
             cudaError_t,
             [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, cudaMemcpyKind],
         ),
+        # ​cudaError_t cudaMemcpyAsync ( void* dst, const void* src, size_t count, cudaMemcpyKind kind, cudaStream_t stream ) # noqa
+        Function(
+            "cudaMemcpyAsync",
+            cudaError_t,
+            [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+                cudaMemcpyKind,
+                cudaStream_t,
+            ],
+        ),
+        # cudaError_t cudaStreamCreate ( cudaStream_t* pStream )
+        Function(
+            "cudaStreamCreate",
+            cudaError_t,
+            [ctypes.POINTER(cudaStream_t)],
+        ),
+        # cudaError_t cudaStreamDestroy ( cudaStream_t stream )
+        Function(
+            "cudaStreamDestroy",
+            cudaError_t,
+            [cudaStream_t],
+        ),
+        # cudaError_t cudaStreamSynchronize ( cudaStream_t stream )
+        Function(
+            "cudaStreamSynchronize",
+            cudaError_t,
+            [cudaStream_t],
+        ),
         # cudaError_t cudaIpcGetMemHandle ( cudaIpcMemHandle_t* handle, void* devPtr ) # noqa
         Function(
             "cudaIpcGetMemHandle",
@@ -90,6 +121,10 @@ class CudaRTLibrary:
         "cudaFree": "hipFree",
         "cudaMemset": "hipMemset",
         "cudaMemcpy": "hipMemcpy",
+        "cudaMemcpyAsync": "hipMemcpyAsync",
+        "cudaStreamCreate": "hipStreamCreate",
+        "cudaStreamDestroy": "hipStreamDestroy",
+        "cudaStreamSynchronize": "hipStreamSynchronize",
         "cudaIpcGetMemHandle": "hipIpcGetMemHandle",
         "cudaIpcOpenMemHandle": "hipIpcOpenMemHandle",
     }
@@ -171,6 +206,28 @@ class CudaRTLibrary:
         cudaMemcpyDefault = 4
         kind = cudaMemcpyDefault
         self.CUDART_CHECK(self.funcs["cudaMemcpy"](dst, src, count, kind))
+
+    def cudaMemcpyAsync(
+        self,
+        dst: ctypes.c_void_p,
+        src: ctypes.c_void_p,
+        count: int,
+        stream: cudaStream_t,
+    ) -> None:
+        cudaMemcpyDefault = 4
+        kind = cudaMemcpyDefault
+        self.CUDART_CHECK(self.funcs["cudaMemcpyAsync"](dst, src, count, kind, stream))
+
+    def cudaStreamCreate(self) -> cudaStream_t:
+        stream = cudaStream_t()
+        self.CUDART_CHECK(self.funcs["cudaStreamCreate"](ctypes.byref(stream)))
+        return stream
+
+    def cudaStreamDestroy(self, stream: cudaStream_t) -> None:
+        self.CUDART_CHECK(self.funcs["cudaStreamDestroy"](stream))
+
+    def cudaStreamSynchronize(self, stream: cudaStream_t) -> None:
+        self.CUDART_CHECK(self.funcs["cudaStreamSynchronize"](stream))
 
     def cudaIpcGetMemHandle(self, devPtr: ctypes.c_void_p) -> cudaIpcMemHandle_t:
         handle = cudaIpcMemHandle_t()
